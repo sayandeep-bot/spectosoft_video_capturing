@@ -13,10 +13,23 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
     MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_PRIMARIES, MF_SDK_VERSION,
 };
-use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+    COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED,
+};
 
 #[cfg(feature = "audio_capture")]
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use windows::Win32::Media::Audio::{
+    eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
+    MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+};
+
+// --- START: VOLUME CONTROL CONSTANTS ---
+// Adjust these values to change the volume balance in the final video.
+// 2.0 = 200% volume (louder), 0.5 = 50% volume (quieter)
+const MIC_VOLUME: f32 = 2.5;
+const SYSTEM_VOLUME: f32 = 0.15;
+// --- END: VOLUME CONTROL CONSTANTS ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioSource {
@@ -52,8 +65,14 @@ pub struct Mp4SegmentWriter {
     start_instant: Instant,
     last_video_time_100ns: u64,
     #[cfg(feature = "audio_capture")]
-    _audio_streams: Vec<cpal::Stream>,
-    mix_buffer: std::sync::Arc<std::sync::Mutex<Vec<i16>>>,
+    _system_audio_thread: Option<std::thread::JoinHandle<()>>,
+    #[cfg(feature = "audio_capture")]
+    _mic_audio_thread: Option<std::thread::JoinHandle<()>>,
+    #[cfg(feature = "audio_capture")]
+    audio_stop_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    system_buffer: std::sync::Arc<std::sync::Mutex<Vec<i16>>>,
+    mic_buffer: std::sync::Arc<std::sync::Mutex<Vec<i16>>>,
+    audio_source: AudioSource,
     pub output_path: PathBuf,
 }
 
@@ -141,7 +160,7 @@ impl Mp4SegmentWriter {
                 out_a.SetUINT32(&MF_MT_AVG_BITRATE, cfg.audio_bitrate_kbps * 1000)?;
                 let audio_stream_index = sink.AddStream(&out_a)?;
 
-                // Audio Input Type (PCM)
+                // Audio Input Type (PCM 16-bit)
                 let in_a = MFCreateMediaType()?;
                 in_a.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
                 in_a.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
@@ -178,8 +197,14 @@ impl Mp4SegmentWriter {
             start_instant: Instant::now(),
             last_video_time_100ns: 0,
             #[cfg(feature = "audio_capture")]
-            _audio_streams: Vec::new(),
-            mix_buffer: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            _system_audio_thread: None,
+            #[cfg(feature = "audio_capture")]
+            _mic_audio_thread: None,
+            #[cfg(feature = "audio_capture")]
+            audio_stop_signal: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            system_buffer: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            mic_buffer: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            audio_source: cfg.audio_source,
             output_path: path,
         };
 
@@ -245,8 +270,23 @@ impl Mp4SegmentWriter {
         Ok(())
     }
 
-    pub fn finalize(self) -> anyhow::Result<PathBuf> {
+    pub fn finalize(mut self) -> anyhow::Result<PathBuf> {
         log::info!("Finalizing MP4 file with {} frames", self.frame_index);
+
+        // Stop audio threads
+        #[cfg(feature = "audio_capture")]
+        {
+            self.audio_stop_signal
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+
+            if let Some(thread) = self._system_audio_thread.take() {
+                let _ = thread.join();
+            }
+            if let Some(thread) = self._mic_audio_thread.take() {
+                let _ = thread.join();
+            }
+        }
+
         unsafe {
             let _ = self.sink.Finalize();
         }
@@ -258,199 +298,36 @@ impl Mp4SegmentWriter {
 
     #[cfg(feature = "audio_capture")]
     fn start_audio_capture(&mut self, source: AudioSource) -> anyhow::Result<()> {
-        use cpal::{InputCallbackInfo, SampleFormat, StreamConfig, StreamError};
-
         log::info!("Starting audio capture with source: {:?}", source);
 
-        let host = cpal::default_host();
-        let max_buffer_samples = (3 * self.audio_sample_rate as usize) * 2;
-
-        let build_stream = |device: &cpal::Device,
-                            mix_buffer: std::sync::Arc<std::sync::Mutex<Vec<i16>>>,
-                            device_name: String|
-         -> anyhow::Result<cpal::Stream> {
-            let cfg_any = device.default_input_config()?;
-            let channels = cfg_any.channels() as usize;
-            let scfg: StreamConfig = cfg_any.clone().into();
-
-            log::info!(
-                "Starting {} audio: {} channels, {:?}, {}Hz",
-                device_name,
-                channels,
-                cfg_any.sample_format(),
-                cfg_any.sample_rate().0
-            );
-
-            let device_name_clone = device_name.clone();
-            let err_cb = move |err: StreamError| {
-                log::error!("{} audio stream error: {:?}", device_name_clone, err);
-            };
-
-            let stream = match cfg_any.sample_format() {
-                SampleFormat::I16 => {
-                    let mix = mix_buffer.clone();
-                    let data_cb = move |data: &[i16], _info: &InputCallbackInfo| {
-                        let mut buf = mix.lock().unwrap();
-                        if channels == 2 {
-                            buf.extend_from_slice(data);
-                        } else {
-                            for &s in data {
-                                buf.push(s);
-                                buf.push(s);
-                            }
-                        }
-                        if buf.len() > max_buffer_samples {
-                            let excess = buf.len().saturating_sub(max_buffer_samples);
-                            if excess > 0 {
-                                buf.drain(0..excess);
-                            }
-                        }
-                    };
-                    device.build_input_stream::<i16, _, _>(&scfg, data_cb, err_cb, None)?
-                }
-                SampleFormat::U16 => {
-                    let mix = mix_buffer.clone();
-                    let data_cb = move |data: &[u16], _info: &InputCallbackInfo| {
-                        let mut buf = mix.lock().unwrap();
-                        if channels == 2 {
-                            for &s in data {
-                                buf.push((s as i32 - 32768) as i16);
-                            }
-                        } else {
-                            for &s in data {
-                                let v = (s as i32 - 32768) as i16;
-                                buf.push(v);
-                                buf.push(v);
-                            }
-                        }
-                        if buf.len() > max_buffer_samples {
-                            let excess = buf.len().saturating_sub(max_buffer_samples);
-                            if excess > 0 {
-                                buf.drain(0..excess);
-                            }
-                        }
-                    };
-                    device.build_input_stream::<u16, _, _>(&scfg, data_cb, err_cb, None)?
-                }
-                SampleFormat::F32 => {
-                    let mix = mix_buffer.clone();
-                    let data_cb = move |data: &[f32], _info: &InputCallbackInfo| {
-                        let mut buf = mix.lock().unwrap();
-                        if channels == 2 {
-                            for &s in data {
-                                buf.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
-                            }
-                        } else {
-                            for &s in data {
-                                let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                                buf.push(v);
-                                buf.push(v);
-                            }
-                        }
-                        if buf.len() > max_buffer_samples {
-                            let excess = buf.len().saturating_sub(max_buffer_samples);
-                            if excess > 0 {
-                                buf.drain(0..excess);
-                            }
-                        }
-                    };
-                    device.build_input_stream::<f32, _, _>(&scfg, data_cb, err_cb, None)?
-                }
-                _ => return Err(anyhow::anyhow!("Unsupported sample format")),
-            };
-
-            stream.play()?;
-            log::info!("{} audio stream started successfully", device_name);
-            Ok(stream)
-        };
-
-        let mut streams = Vec::new();
-
-        // Microphone
-        if source == AudioSource::Microphone || source == AudioSource::Both {
-            if let Some(mic_device) = host.default_input_device() {
-                let name = mic_device
-                    .name()
-                    .unwrap_or_else(|_| "Unknown Mic".to_string());
-                log::info!("Found microphone device: {}", name);
-                match build_stream(
-                    &mic_device,
-                    self.mix_buffer.clone(),
-                    format!("Microphone ({})", name),
-                ) {
-                    Ok(stream) => streams.push(stream),
-                    Err(e) => log::warn!("Failed to start microphone: {:?}", e),
-                }
-            } else {
-                log::warn!("No default microphone found");
-            }
-        }
-
-        // System audio (loopback)
+        // Start WASAPI system audio capture (loopback)
         if source == AudioSource::System || source == AudioSource::Both {
-            log::info!("Searching for system audio (loopback) devices...");
-            let mut found_loopback = false;
+            let buffer = self.system_buffer.clone();
+            let stop_signal = self.audio_stop_signal.clone();
 
-            if let Ok(devices) = host.input_devices() {
-                let devices_vec: Vec<_> = devices.collect();
-                log::info!("Found {} input devices total", devices_vec.len());
-
-                for device in devices_vec {
-                    if let Ok(name) = device.name() {
-                        log::debug!("Checking device: {}", name);
-                        let name_lower = name.to_lowercase();
-
-                        if name_lower.contains("stereo mix")
-                            || name_lower.contains("wave out mix")
-                            || name_lower.contains("what u hear")
-                            || name_lower.contains("loopback")
-                            || name_lower.contains("what you hear")
-                        {
-                            log::info!("Found loopback device: {}", name);
-                            match build_stream(
-                                &device,
-                                self.mix_buffer.clone(),
-                                format!("System Audio ({})", name),
-                            ) {
-                                Ok(stream) => {
-                                    streams.push(stream);
-                                    found_loopback = true;
-                                    break;
-                                }
-                                Err(e) => log::warn!(
-                                    "Failed to start system audio from {}: {:?}",
-                                    name,
-                                    e
-                                ),
-                            }
-                        }
-                    }
+            let thread = std::thread::spawn(move || {
+                if let Err(e) = capture_system_audio_wasapi(stop_signal, buffer) {
+                    log::error!("System audio capture failed: {:?}", e);
                 }
-            }
+            });
 
-            if !found_loopback {
-                log::warn!("═══════════════════════════════════════════════════════════");
-                log::warn!("System audio (loopback) NOT AVAILABLE");
-                log::warn!("To enable system audio capture:");
-                log::warn!("1. Right-click speaker icon → 'Sounds'");
-                log::warn!("2. 'Recording' tab → Right-click → 'Show Disabled Devices'");
-                log::warn!("3. Enable 'Stereo Mix' or 'Wave Out Mix'");
-                log::warn!("4. Set it as default or at least enable it");
-                log::warn!("OR install VB-Cable: https://vb-audio.com/Cable/");
-                log::warn!("═══════════════════════════════════════════════════════════");
-            }
+            self._system_audio_thread = Some(thread);
+            log::info!("✓ Started WASAPI system audio loopback thread");
         }
 
-        self._audio_streams = streams;
+        // Start WASAPI microphone capture
+        if source == AudioSource::Microphone || source == AudioSource::Both {
+            let buffer = self.mic_buffer.clone();
+            let stop_signal = self.audio_stop_signal.clone();
 
-        if self._audio_streams.is_empty() {
-            log::error!("No audio streams started - audio will NOT be recorded!");
-            return Err(anyhow::anyhow!("No audio devices available"));
-        } else {
-            log::info!(
-                "✓ Successfully started {} audio stream(s)",
-                self._audio_streams.len()
-            );
+            let thread = std::thread::spawn(move || {
+                if let Err(e) = capture_microphone_wasapi(stop_signal, buffer) {
+                    log::error!("Microphone capture failed: {:?}", e);
+                }
+            });
+
+            self._mic_audio_thread = Some(thread);
+            log::info!("✓ Started WASAPI microphone capture thread");
         }
 
         Ok(())
@@ -473,16 +350,51 @@ impl Mp4SegmentWriter {
         let channels = self.audio_channels as usize;
         let samples_needed_total = (samples_needed as usize) * channels;
 
-        let mut mix = self.mix_buffer.lock().unwrap();
-        let available = mix.len();
+        // Get audio from appropriate source(s) and mix
+        let audio_data = match self.audio_source {
+            AudioSource::System => {
+                let mut sys = self.system_buffer.lock().unwrap();
+                let to_take = sys.len().min(samples_needed_total);
+                let mut data: Vec<i16> = sys.drain(..to_take).collect();
+                data.resize(samples_needed_total, 0);
+                data
+            }
+            AudioSource::Microphone => {
+                let mut mic = self.mic_buffer.lock().unwrap();
+                let to_take = mic.len().min(samples_needed_total);
+                let mut data: Vec<i16> = mic.drain(..to_take).collect();
+                data.resize(samples_needed_total, 0);
+                data
+            }
+            AudioSource::Both => {
+                // PROPER MIXING: Weighted mix with volume control
+                let mut sys = self.system_buffer.lock().unwrap();
+                let mut mic = self.mic_buffer.lock().unwrap();
 
-        let to_take = available.min(samples_needed_total);
-        let mut audio_data: Vec<i16> = mix.drain(..to_take).collect();
+                let sys_take = sys.len().min(samples_needed_total);
+                let mic_take = mic.len().min(samples_needed_total);
 
-        if audio_data.len() < samples_needed_total {
-            audio_data.resize(samples_needed_total, 0);
-        }
+                let sys_data: Vec<i16> = sys.drain(..sys_take).collect();
+                let mic_data: Vec<i16> = mic.drain(..mic_take).collect();
 
+                let max_len = sys_data.len().max(mic_data.len()).max(samples_needed_total);
+                let mut mixed = Vec::with_capacity(max_len);
+
+                for i in 0..max_len {
+                    let sys_sample = sys_data.get(i).copied().unwrap_or(0) as f32;
+                    let mic_sample = mic_data.get(i).copied().unwrap_or(0) as f32;
+                    
+                    // Apply volume multipliers and mix
+                    let mixed_f32 = (sys_sample * SYSTEM_VOLUME) + (mic_sample * MIC_VOLUME);
+                    let mixed_sample = mixed_f32.clamp(-32768.0, 32767.0) as i16;
+                    mixed.push(mixed_sample);
+                }
+
+                mixed
+            }
+        };
+
+        // Convert to bytes and write
         let mut bytes = Vec::with_capacity(audio_data.len() * 2);
         for &sample in &audio_data {
             bytes.extend_from_slice(&sample.to_le_bytes());
@@ -505,6 +417,227 @@ impl Mp4SegmentWriter {
         self.audio_time_100ns += dur_100ns;
         Ok(())
     }
+}
+
+// WASAPI System Audio Capture (Loopback)
+#[cfg(feature = "audio_capture")]
+fn capture_system_audio_wasapi(
+    stop_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mix_buffer: std::sync::Arc<std::sync::Mutex<Vec<i16>>>,
+) -> anyhow::Result<()> {
+    unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+
+        // Get default output device
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
+        let audio_client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+        let wave_format_ptr = audio_client.GetMixFormat()?;
+        let wave_format = *wave_format_ptr;
+
+        let sample_rate = wave_format.nSamplesPerSec;
+        let channels = wave_format.nChannels;
+        let bits_per_sample = wave_format.wBitsPerSample;
+
+        log::info!(
+            "System audio format: {}Hz, {} channels, {} bits",
+            sample_rate,
+            channels,
+            bits_per_sample
+        );
+
+        audio_client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK,
+            200_000_000, // 2 seconds buffer
+            0,
+            wave_format_ptr,
+            None,
+        )?;
+
+        CoTaskMemFree(Some(wave_format_ptr as *const _));
+
+        let capture_client: IAudioCaptureClient = audio_client.GetService()?;
+        audio_client.Start()?;
+
+        log::info!("✓ WASAPI system audio capture started");
+
+        let max_samples = 288_000; // 3 seconds @ 48kHz stereo
+
+        let mut prev_sample: i16 = 0;
+        while !stop_signal.load(std::sync::atomic::Ordering::SeqCst) {
+            let packet_size = capture_client.GetNextPacketSize()?;
+            if packet_size == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+
+            let mut data_ptr = std::ptr::null_mut();
+            let mut num_frames = 0;
+            let mut flags = 0;
+            capture_client.GetBuffer(&mut data_ptr, &mut num_frames, &mut flags, None, None)?;
+
+            if num_frames > 0 {
+                let ch = channels as usize;
+                let num_samples = num_frames as usize * ch;
+
+                let mut buf = mix_buffer.lock().unwrap();
+
+                if bits_per_sample == 32 {
+                    // Float32 PCM — most common for system loopback
+                    let samples = std::slice::from_raw_parts(data_ptr as *const f32, num_samples);
+                    for &sample in samples {
+                        let s = (sample * 1.2).clamp(-1.0, 1.0);
+                        let mut s16 = if s >= 0.0 {
+                            (s * 32767.0) as i16
+                        } else {
+                            (s * 32768.0) as i16
+                        };
+
+                        // Simple low-pass filter to smooth hiss
+                        s16 = ((prev_sample as f32 * 0.3) + (s16 as f32 * 0.7)) as i16;
+                        prev_sample = s16;
+
+                        buf.push(s16);
+                    }
+                } else if bits_per_sample == 16 {
+                    let samples = std::slice::from_raw_parts(data_ptr as *const i16, num_samples);
+                    buf.extend_from_slice(samples);
+                } else {
+                    log::warn!("Unsupported PCM bit depth: {}", bits_per_sample);
+                }
+
+                if buf.len() > max_samples {
+                    let len = buf.len();
+                    let excess = len - max_samples;
+                    buf.drain(0..excess);
+                }
+
+                capture_client.ReleaseBuffer(num_frames)?;
+            }
+        }
+
+        audio_client.Stop()?;
+        CoUninitialize();
+        log::info!("WASAPI system audio capture stopped");
+    }
+
+    Ok(())
+}
+
+// WASAPI Microphone Capture
+#[cfg(feature = "audio_capture")]
+fn capture_microphone_wasapi(
+    stop_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mix_buffer: std::sync::Arc<std::sync::Mutex<Vec<i16>>>,
+) -> anyhow::Result<()> {
+    unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let device = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)?;
+
+        let audio_client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+        let wave_format_ptr = audio_client.GetMixFormat()?;
+        let wave_format = *wave_format_ptr;
+
+        let sample_rate = wave_format.nSamplesPerSec;
+        let channels = wave_format.nChannels;
+        let bits_per_sample = wave_format.wBitsPerSample;
+
+        log::info!(
+            "Microphone format: {}Hz, {} channels, {} bits",
+            sample_rate,
+            channels,
+            bits_per_sample
+        );
+
+        audio_client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            0, // No special flags for microphone
+            200_000_000,
+            0,
+            wave_format_ptr,
+            None,
+        )?;
+
+        CoTaskMemFree(Some(wave_format_ptr as *const _));
+
+        let capture_client: IAudioCaptureClient = audio_client.GetService()?;
+        audio_client.Start()?;
+
+        log::info!("✓ WASAPI microphone capture started");
+
+        let max_samples = 288_000;
+
+        while !stop_signal.load(std::sync::atomic::Ordering::SeqCst) {
+            let packet_size = capture_client.GetNextPacketSize()?;
+            if packet_size == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+
+            let mut data_ptr = std::ptr::null_mut();
+            let mut num_frames = 0;
+            let mut flags = 0;
+
+            capture_client.GetBuffer(&mut data_ptr, &mut num_frames, &mut flags, None, None)?;
+
+            if num_frames > 0 {
+                let ch = channels as usize;
+                let num_samples = num_frames as usize * ch;
+                let samples_slice = std::slice::from_raw_parts(data_ptr as *const f32, num_samples);
+
+                let mut buf = mix_buffer.lock().unwrap();
+                let mut prev = 0i16;
+
+                // Convert to stereo if mono
+                if ch == 1 {
+                    for &sample in samples_slice {
+                        let s = (sample * 1.2).clamp(-1.0, 1.0);
+                        let s16 = if s >= 0.0 {
+                            (s * 32767.0) as i16
+                        } else {
+                            (s * 32768.0) as i16
+                        };
+
+                        // Simple low-pass smoothing filter
+                        let filtered = ((prev as f32 * 0.3) + (s16 as f32 * 0.7)) as i16;
+                        prev = filtered;
+
+                        // Duplicate for stereo
+                        buf.push(filtered);
+                        buf.push(filtered);
+                    }
+                } else {
+                    for &sample in samples_slice {
+                        let s = (sample * 1.2).clamp(-1.0, 1.0);
+                        let s16 = if s >= 0.0 {
+                            (s * 32767.0) as i16
+                        } else {
+                            (s * 32768.0) as i16
+                        };
+                        buf.push(s16);
+                    }
+                }
+
+                if buf.len() > max_samples {
+                    let excess = buf.len() - max_samples;
+                    buf.drain(0..excess);
+                }
+
+                capture_client.ReleaseBuffer(num_frames)?;
+            }
+        }
+
+        audio_client.Stop()?;
+        CoUninitialize();
+        log::info!("WASAPI microphone capture stopped");
+    }
+
+    Ok(())
 }
 
 // Backward compatibility
